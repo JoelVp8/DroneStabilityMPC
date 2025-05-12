@@ -71,7 +71,7 @@ class DroneMPC:
         Qp = 8.0      # Weight for pitch tracking
         Qy = 5.0      # Weight for yaw tracking
         
-        R_thrust = 0.05  # Penalty on thrust usage
+        R_thrust = 0.01  # Penalty on thrust usage
         R_moment = 0.05  # Penalty on roll/pitch moment usage
         R_yaw    = 0.02  # Penalty on yaw moment usage
 
@@ -215,7 +215,8 @@ def simulate_test_scenario(total_time=30.0):
         gravity_acc = -9.81
         
         # Actualizar velocidades
-        next_state[1] += dt * (control[0] / mpc.m + gravity_acc)  # dz (aceleración vertical)
+        next_state[1] += dt * (control[0] / mpc.m)
+ # dz (aceleración vertical)
         next_state[3] += dt * control[1] / mpc.Ixx  # droll
         next_state[5] += dt * control[2] / mpc.Iyy  # dpitch
         next_state[7] += dt * control[3] / mpc.Izz  # dyaw
