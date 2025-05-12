@@ -215,7 +215,7 @@ def simulate_test_scenario(total_time=30.0):
         gravity_acc = -9.81
         
         # Actualizar velocidades
-        next_state[1] += dt * (control[0] / mpc.m)
+        next_state[1] += dt * (control[0] / mpc.m - mpc.g) 
  # dz (aceleración vertical)
         next_state[3] += dt * control[1] / mpc.Ixx  # droll
         next_state[5] += dt * control[2] / mpc.Iyy  # dpitch
@@ -279,7 +279,7 @@ def plot_results(time_points, states, references):
     axs[3].plot(time_points, states[:, 0], 'blue', linewidth=2)
     axs[3].plot(ref_time_points, references[:, 0], 'blue', linestyle='--', linewidth=1)
     axs[3].set_title('Test Alt', color='blue')
-    axs[3].set_ylim(0.5, 1.3)
+    axs[3].set_ylim(0, 2.0)
     axs[3].grid(True)
     
     axs[3].set_xlabel('Time (sec)')
