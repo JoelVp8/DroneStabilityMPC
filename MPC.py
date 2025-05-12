@@ -22,6 +22,7 @@ class DroneMPC:
         self.Ixx = 0.02   # [kg·m²] inertia around x (roll)
         self.Iyy = 0.02   # [kg·m²] inertia around y (pitch)
         self.Izz = 0.04   # [kg·m²] inertia around z (yaw)
+        self.g   = 9.81   # [m/s²] gravity acceleration
 
         # === Actuator limits (tune for your vehicle) ===
         self.thrust_min = 0.0     # [N]
@@ -32,6 +33,9 @@ class DroneMPC:
         self.Mpitch_max =  0.5
         self.Myaw_min   = -0.2
         self.Myaw_max   =  0.2
+        
+        # Hover thrust - equilibrium point
+        self.u_hover = self.m * self.g
 
         # Pre-build the optimisation problem so each call is fast
         self._build_problem()
@@ -43,6 +47,7 @@ class DroneMPC:
         N   = self.N
         dt  = self.dt
 
+        # System dynamics (discretized)
         A = np.eye(n_x)
         A[0, 1] = dt
         A[2, 3] = dt
@@ -55,72 +60,119 @@ class DroneMPC:
         B[5, 2] = dt / self.Iyy
         B[7, 3] = dt / self.Izz
 
+        # Gravity effect vector (as external disturbance)
+        g_vec = np.zeros(n_x)
+        g_vec[1] = -self.g * dt  # Effect of gravity on vertical velocity
+
         self.x = cp.Variable((n_x, N + 1))
         self.u = cp.Variable((n_u, N))
-
+        
+        # Parameters for initial state and reference
         self.x0_param  = cp.Parameter(n_x)
         self.ref_param = cp.Parameter(4)
 
-        self.g = 9.81
-        self.u_hover = self.m * self.g
-
-
-        # Adjust these weights to match the desired behavior
-        Qz = 10.0     # Weight for altitude tracking
+        # Tuning weights for the cost function
+        Qz = 15.0     # Weight for altitude tracking (increased)
         Qr = 8.0      # Weight for roll tracking
         Qp = 8.0      # Weight for pitch tracking
         Qy = 5.0      # Weight for yaw tracking
         
-        R_thrust = 0.01  # Penalty on thrust usage
-        R_moment = 0.05  # Penalty on roll/pitch moment usage
-        R_yaw    = 0.02  # Penalty on yaw moment usage
+        R_thrust = 0.005  # Penalty on thrust usage (reduced)
+        R_moment = 0.05   # Penalty on roll/pitch moment usage
+        R_yaw    = 0.02   # Penalty on yaw moment usage
+        
+        # Rate of change penalty
+        R_delta = 0.1     # Penalty on control input changes
 
         cost = 0
         constr = [self.x[:, 0] == self.x0_param]
 
+        # Previous control input for first step rate limiting
+        u_prev = cp.Parameter(n_u)
+        self.u_prev_param = u_prev
+        
         for k in range(N):
-            constr += [self.x[:, k + 1] == A @ self.x[:, k] + B @ self.u[:, k]]
+            # System dynamics with gravity
+            constr += [self.x[:, k + 1] == A @ self.x[:, k] + B @ self.u[:, k] + g_vec]
+            
+            # Input constraints
             constr += [self.u[0, k] >= self.thrust_min,
-                       self.u[0, k] <= self.thrust_max,
-                       self.u[1, k] >= self.Mroll_min,
-                       self.u[1, k] <= self.Mroll_max,
-                       self.u[2, k] >= self.Mpitch_min,
-                       self.u[2, k] <= self.Mpitch_max,
-                       self.u[3, k] >= self.Myaw_min,
-                       self.u[3, k] <= self.Myaw_max]
+                      self.u[0, k] <= self.thrust_max,
+                      self.u[1, k] >= self.Mroll_min,
+                      self.u[1, k] <= self.Mroll_max,
+                      self.u[2, k] >= self.Mpitch_min,
+                      self.u[2, k] <= self.Mpitch_max,
+                      self.u[3, k] >= self.Myaw_min,
+                      self.u[3, k] <= self.Myaw_max]
+            
+            # Safety constraints
+            constr += [self.x[0, k] >= 0.05]  # Minimum altitude (5cm safety margin)
+            
+            # Velocity constraints to prevent abrupt movements
+            constr += [self.x[1, k] >= -1.0]  # Max descent velocity
+            constr += [self.x[1, k] <= 1.5]   # Max ascent velocity
+            
+            # Rate of change constraint on first step
+            if k == 0:
+                constr += [cp.abs(self.u[:, k] - self.u_prev_param) <= np.array([2.0, 0.2, 0.2, 0.1])]
+            
+            # Rate of change constraints between consecutive steps
+            if k > 0:
+                constr += [cp.abs(self.u[:, k] - self.u[:, k-1]) <= np.array([2.0, 0.2, 0.2, 0.1])]
 
+            # Tracking error
             z_err    = self.x[0, k] - self.ref_param[0]
             roll_err = self.x[2, k] - self.ref_param[1]
             pitch_err = self.x[4, k] - self.ref_param[2]
             yaw_err  = self.x[6, k] - self.ref_param[3]
-
+            
+            # Stage cost
             cost += Qz * cp.square(z_err) \
                   + Qr * cp.square(roll_err) \
                   + Qp * cp.square(pitch_err) \
                   + Qy * cp.square(yaw_err) \
-                  + R_thrust * cp.square((self.u[0, k])- self.u_hover) \
+                  + R_thrust * cp.square(self.u[0, k] - self.u_hover) \
                   + R_moment * cp.square(self.u[1, k]) \
                   + R_moment * cp.square(self.u[2, k]) \
                   + R_yaw    * cp.square(self.u[3, k])
+            
+            # Add rate of change penalty for all but first step
+            if k > 0:
+                for i in range(n_u):
+                    cost += R_delta * cp.square(self.u[i, k] - self.u[i, k-1])
 
+        # Terminal cost
         z_err_T    = self.x[0, N] - self.ref_param[0]
         roll_err_T = self.x[2, N] - self.ref_param[1]
         pitch_err_T = self.x[4, N] - self.ref_param[2]
         yaw_err_T  = self.x[6, N] - self.ref_param[3]
 
-        cost += Qz * cp.square(z_err_T) \
-              + Qr * cp.square(roll_err_T) \
-              + Qp * cp.square(pitch_err_T) \
-              + Qy * cp.square(yaw_err_T)
+        # Higher terminal weights for better reference tracking
+        cost += 2 * Qz * cp.square(z_err_T) \
+              + 2 * Qr * cp.square(roll_err_T) \
+              + 2 * Qp * cp.square(pitch_err_T) \
+              + 2 * Qy * cp.square(yaw_err_T)
 
         self._prob = cp.Problem(cp.Minimize(cost), constr)
+        
+        # Initialize previous control input
+        self.prev_u = np.zeros(n_u)
+        self.prev_u[0] = self.u_hover  # Initialize with hover thrust
 
     def _solve_mpc(self):
         try:
-            self._prob.solve(solver=cp.OSQP, warm_start=True)
+            self._prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+            solved = True
         except cp.SolverError:
             print("Solver error, trying again without warm start")
-            self._prob.solve(solver=cp.OSQP)
+            try:
+                self._prob.solve(solver=cp.OSQP, verbose=False)
+                solved = True
+            except cp.SolverError:
+                print("Solver failed again, using fallback control")
+                solved = False
+        
+        return solved
 
     def predict(self, entrada: np.ndarray) -> np.ndarray:
         """
@@ -140,20 +192,33 @@ class DroneMPC:
         x_hat = entrada[:8]
         ref = entrada[8:]
 
-        self.x0_param.value  = x_hat
+        self.x0_param.value = x_hat
         self.ref_param.value = ref
+        self.u_prev_param.value = self.prev_u
 
-        self._solve_mpc()
-        return self.u[:, 0].value
+        solved = self._solve_mpc()
+        
+        if solved and self.u[:, 0].value is not None:
+            control = self.u[:, 0].value
+        else:
+            # Fallback control: maintain hover thrust and zero moments
+            control = np.zeros(4)
+            control[0] = self.u_hover
+            print("Using fallback control")
+        
+        # Store for next iteration
+        self.prev_u = control
+        
+        return control
 
 
 def simulate_test_scenario(total_time=30.0):
     """
-    Simula el escenario de prueba similar a las gráficas proporcionadas.
+    Simula el escenario de prueba con un despegue y maniobras seguras.
     """
     # Crear el controlador MPC
     dt = 0.02  # 50 Hz
-    mpc = DroneMPC(dt=dt, horizon=50)
+    mpc = DroneMPC(dt=dt, horizon=20)  # Reducido a 20 pasos
     
     # Calcular el número de pasos
     steps = int(total_time / dt)
@@ -163,20 +228,32 @@ def simulate_test_scenario(total_time=30.0):
     inputs = np.zeros((steps, 4))
     references = np.zeros((steps, 4))
     
-    # Estado inicial (en el suelo, altitud 0)
-    states[0] = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    # Estado inicial (en el suelo, con pequeña altura segura)
+    states[0] = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     
-    # Definir perfiles de referencia similares a la gráfica
+    # Inicializar el empuje con valor de hover para evitar caída
+    mpc.prev_u[0] = mpc.u_hover
+    
+    # Definir perfiles de referencia 
     time_points = np.arange(0, total_time, dt)
+    time_points = time_points[:steps]  # Asegurar longitud correcta
     
-    # Asegurarse de que time_points tenga exactamente 'steps' elementos
-    time_points = time_points[:steps]
+    # Altitud: Transición suave desde 0.1m a 1.2m
+    alt_ref = np.ones_like(time_points) * 0.1  # Altura inicial segura
     
-    # Altitud: Iniciar a 0.6m y subir a 1.2m
-    alt_ref = np.zeros_like(time_points)        # Todo parte desde 0
-    alt_ref[time_points >= 1.0] = 1.2           # Sube a 1.2 en t=1s
-         # Sube a 1.2 en t=1s
-
+    # Rampa suave de subida en lugar de escalón
+    t_start = 1.0   # Tiempo de inicio de subida
+    t_end = 3.0     # Tiempo en que se alcanza altura final
+    
+    for i, t in enumerate(time_points):
+        if t < t_start:
+            alt_ref[i] = 0.1
+        elif t < t_end:
+            # Transición suave (rampa)
+            progress = (t - t_start) / (t_end - t_start)
+            alt_ref[i] = 0.1 + progress * (1.2 - 0.1)
+        else:
+            alt_ref[i] = 1.2
     
     # Roll: Normalmente 0, pero con cambios de +3 a -3 grados entre 15-18s
     roll_ref = np.zeros_like(time_points)
@@ -211,12 +288,8 @@ def simulate_test_scenario(total_time=30.0):
         # Simular la dinámica del dron
         next_state = np.copy(states[k])
         
-        # Gravedad (simplificada)
-        gravity_acc = -9.81
-        
-        # Actualizar velocidades
-        next_state[1] += dt * (control[0] / mpc.m - mpc.g) 
- # dz (aceleración vertical)
+        # Actualizar velocidades (con gravedad correctamente aplicada)
+        next_state[1] += dt * (control[0] / mpc.m - mpc.g)  # dz (aceleración vertical)
         next_state[3] += dt * control[1] / mpc.Ixx  # droll
         next_state[5] += dt * control[2] / mpc.Iyy  # dpitch
         next_state[7] += dt * control[3] / mpc.Izz  # dyaw
@@ -227,23 +300,31 @@ def simulate_test_scenario(total_time=30.0):
         next_state[4] += dt * next_state[5]  # pitch
         next_state[6] += dt * next_state[7]  # yaw
         
+        # Restricción física: el dron no puede estar por debajo del suelo
+        next_state[0] = max(0.0, next_state[0])
+        
+        # Si el dron toca el suelo, detener la velocidad vertical
+        if next_state[0] <= 0.001:
+            next_state[1] = 0.0
+        
         # Guardar el estado para el siguiente paso
         states[k+1] = next_state
     
-    # Crear el vector de tiempo para graficar (asegurarse que tenga la misma longitud que states)
+    # Crear el vector de tiempo para graficar
     plot_time_points = np.linspace(0, total_time, steps+1)
     
     return plot_time_points, states, inputs, references
 
 
-def plot_results(time_points, states, references):
+def plot_results(time_points, states, inputs, references):
     """
-    Genera gráficas similares a las mostradas.
+    Genera gráficas detalladas del comportamiento del dron.
     """
     # Asegurarse de que references tenga la misma longitud que time_points para graficar
     ref_time_points = time_points[:-1]  # Quitar el último punto para que coincida con references
     
-    fig, axs = plt.subplots(4, 1, figsize=(10, 10))
+    # Crear subfiguras
+    fig, axs = plt.subplots(5, 1, figsize=(12, 15))
     
     # Convertir radianes a grados para ángulos
     roll_deg = np.degrees(states[:, 2])
@@ -254,38 +335,76 @@ def plot_results(time_points, states, references):
     pitch_ref_deg = np.degrees(references[:, 2])
     yaw_ref_deg = np.degrees(references[:, 3])
     
-    # Roll
-    axs[0].plot(time_points, roll_deg, 'purple', linewidth=2)
-    axs[0].plot(ref_time_points, roll_ref_deg, 'purple', linestyle='--', linewidth=1)
-    axs[0].set_title('Test Roll', color='purple')
-    axs[0].set_ylim(-5, 5)
+    # Altitud (primera para ver claramente)
+    axs[0].plot(time_points, states[:, 0], 'blue', linewidth=2, label='Actual')
+    axs[0].plot(ref_time_points, references[:, 0], 'blue', linestyle='--', linewidth=1, label='Reference')
+    axs[0].set_title('Test Alt', color='blue')
+    axs[0].set_ylim(-0.1, 1.3)
     axs[0].grid(True)
+    axs[0].legend()
     
-    # Pitch
-    axs[1].plot(time_points, pitch_deg, 'red', linewidth=2)
-    axs[1].plot(ref_time_points, pitch_ref_deg, 'red', linestyle='--', linewidth=1)
-    axs[1].set_title('Test Pitch', color='red')
-    axs[1].set_ylim(-20, 20)
+    # Velocidad vertical
+    axs[1].plot(time_points, states[:, 1], 'green', linewidth=2)
+    axs[1].set_title('Vertical Velocity (dz)', color='green')
+    axs[1].set_ylim(-1.5, 1.5)
     axs[1].grid(True)
     
-    # Yaw
-    axs[2].plot(time_points, yaw_deg, 'magenta', linewidth=2)
-    axs[2].plot(ref_time_points, yaw_ref_deg, 'magenta', linestyle='--', linewidth=1)
-    axs[2].set_title('Test Yaw', color='magenta')
-    axs[2].set_ylim(-5, 25)
+    # Roll
+    axs[2].plot(time_points, roll_deg, 'purple', linewidth=2)
+    axs[2].plot(ref_time_points, roll_ref_deg, 'purple', linestyle='--', linewidth=1)
+    axs[2].set_title('Test Roll', color='purple')
+    axs[2].set_ylim(-5, 5)
     axs[2].grid(True)
     
-    # Altitud
-    axs[3].plot(time_points, states[:, 0], 'blue', linewidth=2)
-    axs[3].plot(ref_time_points, references[:, 0], 'blue', linestyle='--', linewidth=1)
-    axs[3].set_title('Test Alt', color='blue')
-    axs[3].set_ylim(0, 2.0)
+    # Pitch
+    axs[3].plot(time_points, pitch_deg, 'red', linewidth=2)
+    axs[3].plot(ref_time_points, pitch_ref_deg, 'red', linestyle='--', linewidth=1)
+    axs[3].set_title('Test Pitch', color='red')
+    axs[3].set_ylim(-20, 20)
     axs[3].grid(True)
     
-    axs[3].set_xlabel('Time (sec)')
+    # Yaw
+    axs[4].plot(time_points, yaw_deg, 'magenta', linewidth=2)
+    axs[4].plot(ref_time_points, yaw_ref_deg, 'magenta', linestyle='--', linewidth=1)
+    axs[4].set_title('Test Yaw', color='magenta')
+    axs[4].set_ylim(-5, 25)
+    axs[4].grid(True)
+    
+    axs[4].set_xlabel('Time (sec)')
     
     plt.tight_layout()
     plt.savefig('drone_stabilization_test.png')
+    
+    # Graficar los controles también
+    fig2, axs2 = plt.subplots(4, 1, figsize=(12, 10))
+    
+    # Thrust
+    axs2[0].plot(ref_time_points, inputs[:, 0], 'blue', linewidth=2)
+    axs2[0].axhline(y=0.6*9.81, color='r', linestyle='--', label='Hover thrust')
+    axs2[0].set_title('Thrust')
+    axs2[0].grid(True)
+    axs2[0].legend()
+    
+    # Roll moment
+    axs2[1].plot(ref_time_points, inputs[:, 1], 'purple', linewidth=2)
+    axs2[1].set_title('Roll Moment')
+    axs2[1].grid(True)
+    
+    # Pitch moment
+    axs2[2].plot(ref_time_points, inputs[:, 2], 'red', linewidth=2)
+    axs2[2].set_title('Pitch Moment')
+    axs2[2].grid(True)
+    
+    # Yaw moment
+    axs2[3].plot(ref_time_points, inputs[:, 3], 'magenta', linewidth=2)
+    axs2[3].set_title('Yaw Moment')
+    axs2[3].grid(True)
+    
+    axs2[3].set_xlabel('Time (sec)')
+    
+    plt.tight_layout()
+    plt.savefig('drone_control_inputs.png')
+    
     plt.show()
 
 
@@ -297,9 +416,9 @@ def run_test():
     time_points, states, inputs, references = simulate_test_scenario(total_time=30.0)
     
     print("Simulación completada. Mostrando resultados...")
-    plot_results(time_points, states, references)
+    plot_results(time_points, states, inputs, references)
     
-    print("Test finalizado. Los resultados se han guardado en 'drone_stabilization_test.png'")
+    print("Test finalizado. Los resultados se han guardado en 'drone_stabilization_test.png' y 'drone_control_inputs.png'")
     
 
 if __name__ == "__main__":
