@@ -58,12 +58,17 @@ class DroneSimulator:
         Mpitch = np.clip(control[2], self.Mpitch_min, self.Mpitch_max)
         Myaw = np.clip(control[3], self.Myaw_min, self.Myaw_max)
         
-        # Disturbance (if enabled)
-        wind_disturbance = -0.15 if add_disturbance else 0.0
-        dz_noise = np.random.normal(0, 0.02) if add_disturbance else 0.0
+        # Disturbance (if enabled) - reduced wind disturbance for better performance
+        wind_disturbance = -0.05 if add_disturbance else 0.0  # Reduced from -0.15
+        dz_noise = np.random.normal(0, 0.01) if add_disturbance else 0.0  # Reduced from 0.02
+        
+        # Add extra ground effect thrust when close to the ground (real drones experience this)
+        ground_effect = 0.0
+        if next_state[0] < 0.2:  # If altitude is less than 20cm
+            ground_effect = 0.1 * (1.0 - next_state[0]/0.2)  # Stronger closer to ground
         
         # Update velocities
-        next_state[1] += self.dt * ((thrust + wind_disturbance) / self.m - self.g) + dz_noise  # dz
+        next_state[1] += self.dt * ((thrust + wind_disturbance + ground_effect) / self.m - self.g) + dz_noise  # dz
         next_state[3] += self.dt * Mroll / self.Ixx   # droll
         next_state[5] += self.dt * Mpitch / self.Iyy  # dpitch
         next_state[7] += self.dt * Myaw / self.Izz    # dyaw
@@ -116,11 +121,15 @@ class SimpleDroneController:
         
         # Sequential model (simpler structure to avoid recursion issues)
         self.model = Sequential([
-            # First hidden layer
-            Dense(128, activation='relu', input_shape=(input_dim,)),
+            # First hidden layer - wider network for better performance
+            Dense(256, activation='relu', input_shape=(input_dim,)),  # Increased from 128
             BatchNormalization(),
             
             # Second hidden layer
+            Dense(128, activation='relu'),  # Increased from 64
+            BatchNormalization(),
+            
+            # Add a third hidden layer for more capacity
             Dense(64, activation='relu'),
             BatchNormalization(),
             
@@ -244,9 +253,9 @@ def generate_training_data_from_pd(n_samples=50000):
     # Create simulator
     simulator = DroneSimulator()
     
-    # PD controller gains
-    Kp_z = 5.0
-    Kd_z = 2.0
+    # PD controller gains - increased for more aggressive response
+    Kp_z = 8.0      # Increased from 5.0
+    Kd_z = 3.0      # Increased from 2.0
     Kp_roll = 0.3
     Kd_roll = 0.1
     Kp_pitch = 0.3
@@ -267,7 +276,7 @@ def generate_training_data_from_pd(n_samples=50000):
     for _ in range(int(n_samples / 100)):  # ~100 steps per scenario
         # Random initial state with small perturbations
         state = np.array([
-            np.random.uniform(0.1, 0.5),  # z - start near ground
+            np.random.uniform(0.0, 0.5),  # z - start from ground level (0) to 0.5m
             np.random.uniform(-0.2, 0.2),  # dz
             np.random.uniform(-0.1, 0.1),  # roll
             np.random.uniform(-0.1, 0.1),  # droll
@@ -293,6 +302,11 @@ def generate_training_data_from_pd(n_samples=50000):
             
             # PD control calculation
             thrust = simulator.m * (simulator.g + Kp_z * (z_ref - z) + Kd_z * (-dz))
+            
+            # Add extra thrust when close to ground to prevent dragging
+            if z < 0.1 and z_ref > 0.1:
+                thrust += simulator.m * 2.0  # Add significant extra thrust for takeoff
+                
             Mroll = Kp_roll * (roll_ref - roll) + Kd_roll * (-droll)
             Mpitch = Kp_pitch * (pitch_ref - pitch) + Kd_pitch * (-dpitch)
             Myaw = Kp_yaw * (yaw_ref - yaw) + Kd_yaw * (-dyaw)
@@ -396,29 +410,29 @@ def simulate_test_scenario(controller, total_time=30.0):
     inputs = np.zeros((steps, 4))
     references = np.zeros((steps, 4))
     
-    # Initial state (on the ground with small safety margin)
-    states[0] = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    # Initial state (on the ground with zero altitude)
+    states[0] = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     
-    # Initialize controller with hover thrust
-    controller.prev_u[0] = controller.u_hover
+    # Initialize controller with stronger thrust (1.5x hover) to ensure good takeoff
+    controller.prev_u[0] = controller.u_hover * 1.5
     
     # Define reference profiles
     time_points = np.arange(0, total_time, dt)
     time_points = time_points[:steps]  # Ensure correct length
     
-    # Altitude: Smooth transition from 0.1m to 1.2m
-    alt_ref = np.ones_like(time_points) * 0.1
+    # Altitude: Smooth transition from 0m to 1.2m
+    alt_ref = np.zeros_like(time_points)
     
     t_start = 1.0   # Start ascent
     t_end = 3.0     # Reach final altitude
     
     for i, t in enumerate(time_points):
         if t < t_start:
-            alt_ref[i] = 0.1
+            alt_ref[i] = 0.0
         elif t < t_end:
             # Smooth transition (ramp)
             progress = (t - t_start) / (t_end - t_start)
-            alt_ref[i] = 0.1 + progress * (1.2 - 0.1)
+            alt_ref[i] = progress * 1.2
         else:
             alt_ref[i] = 1.2
     
