@@ -288,8 +288,15 @@ def simulate_test_scenario(total_time=30.0):
         # Simular la dinámica del dron
         next_state = np.copy(states[k])
         
-        # Actualizar velocidades (con gravedad correctamente aplicada)
-        next_state[1] += dt * (control[0] / mpc.m - mpc.g)  # dz (aceleración vertical)
+        # Perturbación simulada (viento descendente constante)
+        wind_disturbance = -0.15  # [N] de empuje negativo
+
+        # Ruido leve en la estimación de velocidad vertical
+        dz_noise = np.random.normal(0, 0.02)  # media 0, desviación 0.02 m/s
+
+        # Actualizar velocidad vertical con perturbación y ruido
+        next_state[1] += dt * ((control[0] + wind_disturbance) / mpc.m - mpc.g) + dz_noise
+
         next_state[3] += dt * control[1] / mpc.Ixx  # droll
         next_state[5] += dt * control[2] / mpc.Iyy  # dpitch
         next_state[7] += dt * control[3] / mpc.Izz  # dyaw
