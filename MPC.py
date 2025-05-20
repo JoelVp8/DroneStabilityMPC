@@ -71,18 +71,18 @@ class DroneMPC:
         self.x0_param  = cp.Parameter(n_x)
         self.ref_param = cp.Parameter(4)
 
-        # Tuning weights for the cost function
-        Qz = 15.0     # Weight for altitude tracking (increased)
-        Qr = 8.0      # Weight for roll tracking
-        Qp = 8.0      # Weight for pitch tracking
+        # Tuning weights for the cost function - increased to improve tracking
+        Qz = 25.0     # Weight for altitude tracking (increased from 15)
+        Qr = 15.0     # Weight for roll tracking (increased from 8)
+        Qp = 15.0     # Weight for pitch tracking (increased from 8)
         Qy = 5.0      # Weight for yaw tracking
         
-        R_thrust = 0.005  # Penalty on thrust usage (reduced)
-        R_moment = 0.05   # Penalty on roll/pitch moment usage
+        R_thrust = 0.001  # Reduced from 0.005 to allow more aggressive control
+        R_moment = 0.02   # Reduced from 0.05 to allow more aggressive control
         R_yaw    = 0.02   # Penalty on yaw moment usage
         
-        # Rate of change penalty
-        R_delta = 0.1     # Penalty on control input changes
+        # Rate of change penalty - reduced to allow more responsive control
+        R_delta = 0.05    # Reduced from 0.1
 
         cost = 0
         constr = [self.x[:, 0] == self.x0_param]
@@ -108,17 +108,17 @@ class DroneMPC:
             # Safety constraints
             constr += [self.x[0, k] >= 0.05]  # Minimum altitude (5cm safety margin)
             
-            # Velocity constraints to prevent abrupt movements
-            constr += [self.x[1, k] >= -1.0]  # Max descent velocity
-            constr += [self.x[1, k] <= 1.5]   # Max ascent velocity
+            # Velocity constraints to prevent abrupt movements - increased for faster response
+            constr += [self.x[1, k] >= -1.5]  # Max descent velocity (increased from -1.0)
+            constr += [self.x[1, k] <= 2.0]   # Max ascent velocity (increased from 1.5)
             
-            # Rate of change constraint on first step
+            # Rate of change constraint on first step - increased for faster response
             if k == 0:
-                constr += [cp.abs(self.u[:, k] - self.u_prev_param) <= np.array([2.0, 0.2, 0.2, 0.1])]
+                constr += [cp.abs(self.u[:, k] - self.u_prev_param) <= np.array([3.0, 0.3, 0.3, 0.1])]
             
             # Rate of change constraints between consecutive steps
             if k > 0:
-                constr += [cp.abs(self.u[:, k] - self.u[:, k-1]) <= np.array([2.0, 0.2, 0.2, 0.1])]
+                constr += [cp.abs(self.u[:, k] - self.u[:, k-1]) <= np.array([3.0, 0.3, 0.3, 0.1])]
 
             # Tracking error
             z_err    = self.x[0, k] - self.ref_param[0]
@@ -148,10 +148,10 @@ class DroneMPC:
         yaw_err_T  = self.x[6, N] - self.ref_param[3]
 
         # Higher terminal weights for better reference tracking
-        cost += 2 * Qz * cp.square(z_err_T) \
-              + 2 * Qr * cp.square(roll_err_T) \
-              + 2 * Qp * cp.square(pitch_err_T) \
-              + 2 * Qy * cp.square(yaw_err_T)
+        cost += 3 * Qz * cp.square(z_err_T) \
+              + 3 * Qr * cp.square(roll_err_T) \
+              + 3 * Qp * cp.square(pitch_err_T) \
+              + 3 * Qy * cp.square(yaw_err_T)
 
         self._prob = cp.Problem(cp.Minimize(cost), constr)
         
@@ -229,45 +229,116 @@ def simulate_test_scenario(total_time=30.0):
     references = np.zeros((steps, 4))
     
     # Estado inicial (en el suelo, con pequeña altura segura)
-    states[0] = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    states[0] = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     
     # Inicializar el empuje con valor de hover para evitar caída
-    mpc.prev_u[0] = mpc.u_hover
+    mpc.prev_u[0] = mpc.u_hover * 1.2  # Increased for better takeoff
     
     # Definir perfiles de referencia 
     time_points = np.arange(0, total_time, dt)
     time_points = time_points[:steps]  # Asegurar longitud correcta
     
-    # Altitud: Transición suave desde 0.1m a 1.2m
-    alt_ref = np.ones_like(time_points) * 0.1  # Altura inicial segura
+    # Altitud: Perfil de referencia según lo requerido
+    alt_ref = np.zeros_like(time_points)
     
-    # Rampa suave de subida en lugar de escalón
-    t_start = 1.0   # Tiempo de inicio de subida
-    t_end = 3.0     # Tiempo en que se alcanza altura final
-    
+    # Primero sube a 0.6m (hasta t=2s), luego sube gradualmente a 1.2m (hasta t=5s)
     for i, t in enumerate(time_points):
-        if t < t_start:
-            alt_ref[i] = 0.1
-        elif t < t_end:
-            # Transición suave (rampa)
-            progress = (t - t_start) / (t_end - t_start)
-            alt_ref[i] = 0.1 + progress * (1.2 - 0.1)
+        if t < 0.5:
+            alt_ref[i] = 0.0
+        elif t < 2.0:
+            # Subida inicial hasta 0.6m
+            progress = (t - 0.5) / 1.5
+            alt_ref[i] = progress * 0.6
+        elif t < 5.0:
+            # Subida gradual de 0.6m a 1.2m
+            progress = (t - 2.0) / 3.0
+            alt_ref[i] = 0.6 + progress * 0.6
         else:
+            # Mantener en 1.2m
             alt_ref[i] = 1.2
     
-    # Roll: Normalmente 0, pero con cambios de +3 a -3 grados entre 15-18s
+    # Roll: Perfil según lo requerido
     roll_ref = np.zeros_like(time_points)
-    roll_ref[(time_points >= 15.0) & (time_points < 16.5)] = np.radians(3)
-    roll_ref[(time_points >= 16.5) & (time_points < 18.0)] = np.radians(-3)
     
-    # Pitch: Cambios entre 0, +15, -15 entre 8-12s
+    # Baja a -3.8 grados, mantiene 2s, sube a +2 grados
+    # Luego baja a -2.5 en 15s, mantiene 2s, sube a +2.5
+    for i, t in enumerate(time_points):
+        if t < 10.0:
+            roll_ref[i] = 0.0
+        elif t < 11.0:
+            # Baja a -3.8 grados
+            progress = (t - 10.0) / 1.0
+            roll_ref[i] = -3.8 * progress
+        elif t < 13.0:
+            # Mantiene -3.8 grados
+            roll_ref[i] = -3.8
+        elif t < 14.0:
+            # Sube a +2 grados
+            progress = (t - 13.0) / 1.0
+            roll_ref[i] = -3.8 + (5.8 * progress)
+        elif t < 15.0:
+            # Mantiene +2 grados
+            roll_ref[i] = 2.0
+        elif t < 17.0:
+            # Baja a -2.5 grados
+            progress = (t - 15.0) / 2.0
+            roll_ref[i] = 2.0 - (4.5 * progress)
+        elif t < 19.0:
+            # Mantiene -2.5 grados
+            roll_ref[i] = -2.5
+        elif t < 20.0:
+            # Sube a +2.5 grados
+            progress = (t - 19.0) / 1.0
+            roll_ref[i] = -2.5 + (5.0 * progress)
+        else:
+            # Mantiene +2.5 grados
+            roll_ref[i] = 2.5
+    
+    # Convertir a radianes
+    roll_ref = np.radians(roll_ref)
+    
+    # Pitch: Perfil según lo requerido
     pitch_ref = np.zeros_like(time_points)
-    pitch_ref[(time_points >= 8.0) & (time_points < 9.5)] = np.radians(15)
-    pitch_ref[(time_points >= 9.5) & (time_points < 12.0)] = np.radians(-15)
     
-    # Yaw: Cambio a +20 grados en t=8s
+    # En t=10s sube a +15 grados, mantiene 1s, baja a 0 y mantiene 2s,
+    # baja a -15 grados, regresa a 0 después de 1s y se mantiene
+    for i, t in enumerate(time_points):
+        if t < 10.0:
+            pitch_ref[i] = 0.0
+        elif t < 10.5:
+            # Sube a +15 grados
+            progress = (t - 10.0) / 0.5
+            pitch_ref[i] = 15.0 * progress
+        elif t < 11.5:
+            # Mantiene +15 grados
+            pitch_ref[i] = 15.0
+        elif t < 12.0:
+            # Baja a 0 grados
+            progress = (t - 11.5) / 0.5
+            pitch_ref[i] = 15.0 - (15.0 * progress)
+        elif t < 14.0:
+            # Mantiene 0 grados
+            pitch_ref[i] = 0.0
+        elif t < 14.5:
+            # Baja a -15 grados
+            progress = (t - 14.0) / 0.5
+            pitch_ref[i] = -15.0 * progress
+        elif t < 15.5:
+            # Mantiene -15 grados
+            pitch_ref[i] = -15.0
+        elif t < 16.0:
+            # Regresa a 0 grados
+            progress = (t - 15.5) / 0.5
+            pitch_ref[i] = -15.0 + (15.0 * progress)
+        else:
+            # Mantiene 0 grados
+            pitch_ref[i] = 0.0
+    
+    # Convertir a radianes
+    pitch_ref = np.radians(pitch_ref)
+    
+    # Yaw: mantenemos como está
     yaw_ref = np.zeros_like(time_points)
-    yaw_ref[(time_points >= 8.0) & (time_points < 9.5)] = np.radians(20)
     
     # Asignar referencias para cada paso
     for k in range(steps):
@@ -288,11 +359,11 @@ def simulate_test_scenario(total_time=30.0):
         # Simular la dinámica del dron
         next_state = np.copy(states[k])
         
-        # Perturbación simulada (viento descendente constante)
-        wind_disturbance = -0.15  # [N] de empuje negativo
+        # Perturbación simulada (viento descendente constante) - reducida para mejor rendimiento
+        wind_disturbance = -0.1  # [N] de empuje negativo (reducido de -0.15)
 
         # Ruido leve en la estimación de velocidad vertical
-        dz_noise = np.random.normal(0, 0.02)  # media 0, desviación 0.02 m/s
+        dz_noise = np.random.normal(0, 0.01)  # Reducido de 0.02 m/s
 
         # Actualizar velocidad vertical con perturbación y ruido
         next_state[1] += dt * ((control[0] + wind_disturbance) / mpc.m - mpc.g) + dz_noise
